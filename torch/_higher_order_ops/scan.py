@@ -217,7 +217,7 @@ def scan(
     )
 
     if dim != 0:
-        out = pytree.tree_map(lambda elem: torch.movedim(elem, 0, dim)
+        out = pytree.tree_map(lambda elem: torch.movedim(elem, 0, dim), out)
     
     if reverse:
         out = pytree.tree_map(lambda elem: elem.flip([0]), out)
