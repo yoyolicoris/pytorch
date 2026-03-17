@@ -216,6 +216,9 @@ def scan(
         leaves_xs,
     )
 
+    if dim != 0:
+        out = pytree.tree_map(lambda elem: torch.movedim(elem, 0, dim)
+    
     if reverse:
         out = pytree.tree_map(lambda elem: elem.flip([0]), out)
 
