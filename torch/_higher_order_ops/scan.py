@@ -989,7 +989,7 @@ class ScanAutogradImpl:
         batched_fw_intermediates = pytree.tree_map(
             lambda *tensors: torch.stack(tensors), *fw_intermediates_rows
         )
-        zero_carries = torch.zeros(
+        zero_input_for_jacobian = torch.zeros(
             (scan_length, n_state),
             device=grad_carry[0].device,
             dtype=grad_carry[0].dtype,
@@ -1011,7 +1011,8 @@ class ScanAutogradImpl:
                 [len(self.init), len(self.xs), len(self.additional_inputs)],
             )
             # Fast-path eligibility enforces empty additional_inputs, so
-            # this third chunk exists structurally but has length zero.
+            # this grad_additional_inputs chunk exists structurally but has
+            # length zero.
             return (
                 next_grad_carry[0].reshape(-1),
                 grad_xs[0].reshape(-1),
@@ -1027,9 +1028,11 @@ class ScanAutogradImpl:
             out = _run_backward_from_flat(flat_grad_carry, fw_intermediates, step_grad_y)
             return out, out
 
+        # Compute per-step Jacobians in one transform by vmapping jacrev over
+        # the stacked step inputs.
         (jacobian_outputs, zero_input_eval) = torch.func.vmap(
             torch.func.jacrev(_run_bw_from_flat_with_aux, argnums=0, has_aux=True)
-        )(zero_carries, batched_fw_intermediates, rev_grad_y)
+        )(zero_input_for_jacobian, batched_fw_intermediates, rev_grad_y)
         A, C = jacobian_outputs
         b, d = zero_input_eval
 
@@ -1037,7 +1040,7 @@ class ScanAutogradImpl:
             A_l, b_l = lhs
             A_r, b_r = rhs
             A_new = torch.matmul(A_r, A_l)
-            b_new = torch.matmul(A_r, b_l.unsqueeze(-1)).squeeze(-1) + b_r
+            b_new = torch.addmv(b_r, A_r, b_l)
             return A_new, b_new
 
         A_cumulative, b_cumulative = associative_scan(
