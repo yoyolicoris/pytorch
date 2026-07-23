@@ -978,57 +978,60 @@ class ScanAutogradImpl:
         n_state = grad_carry[0].numel()
         n_x = self.xs[0][0].numel()
 
-        A_rows = []
-        b_rows = []
-        C_rows = []
-        d_rows = []
+        fw_intermediates_rows = []
         rev_grad_y = torch.flip(grad_ys[0], (0,))
 
         for backward_step_idx in range(scan_length):
             step_idx = scan_length - 1 - backward_step_idx
             fw_intermediates = self._rebuild_forward_intermediates_for_step(step_idx)
-            step_grad_y = rev_grad_y[backward_step_idx]
+            fw_intermediates_rows.append(fw_intermediates)
 
-            def _run_backward_from_flat(flat_grad_carry: torch.Tensor):
-                in_grad_carry = flat_grad_carry.reshape(carry_shape)
-                flat_out = self.hop_partitioned_graph.bw_gm(
-                    *fw_intermediates,
-                    in_grad_carry,
-                    step_grad_y,
-                )
-                next_grad_carry, grad_xs, _ = split_into_chunks(
-                    flat_out,
-                    [len(self.init), len(self.xs), len(self.additional_inputs)],
-                )
-                # Fast-path eligibility enforces empty additional_inputs, so
-                # this third chunk exists structurally but has length zero.
-                return (
-                    next_grad_carry[0].reshape(-1),
-                    grad_xs[0].reshape(-1),
-                )
+        batched_fw_intermediates = pytree.tree_map(
+            lambda *tensors: torch.stack(tensors), *fw_intermediates_rows
+        )
+        zero_carries = torch.zeros(
+            (scan_length, n_state),
+            device=grad_carry[0].device,
+            dtype=grad_carry[0].dtype,
+        )
 
-            zero_carry = torch.zeros_like(grad_carry[0]).reshape(-1)
+        def _run_backward_from_flat(
+            flat_grad_carry: torch.Tensor,
+            fw_intermediates,
+            step_grad_y: torch.Tensor,
+        ):
+            in_grad_carry = flat_grad_carry.reshape(carry_shape)
+            flat_out = self.hop_partitioned_graph.bw_gm(
+                *fw_intermediates,
+                in_grad_carry,
+                step_grad_y,
+            )
+            next_grad_carry, grad_xs, _ = split_into_chunks(
+                flat_out,
+                [len(self.init), len(self.xs), len(self.additional_inputs)],
+            )
+            # Fast-path eligibility enforces empty additional_inputs, so
+            # this third chunk exists structurally but has length zero.
+            return (
+                next_grad_carry[0].reshape(-1),
+                grad_xs[0].reshape(-1),
+            )
 
-            def _run_bw_from_flat_with_aux(flat_grad_carry):
-                # Duplicate outputs to get Jacobians and zero-input eval in one
-                # jacrev call.
-                out = _run_backward_from_flat(flat_grad_carry)
-                return out, out
+        def _run_bw_from_flat_with_aux(
+            flat_grad_carry: torch.Tensor,
+            fw_intermediates,
+            step_grad_y: torch.Tensor,
+        ):
+            # Duplicate outputs to get Jacobians and zero-input eval in one
+            # jacrev call.
+            out = _run_backward_from_flat(flat_grad_carry, fw_intermediates, step_grad_y)
+            return out, out
 
-            (jacobian_outputs, zero_input_eval) = torch.func.jacrev(
-                _run_bw_from_flat_with_aux, has_aux=True
-            )(zero_carry)
-            jac_next, jac_x = jacobian_outputs
-            b_step, d_step = zero_input_eval
-            A_rows.append(jac_next)
-            b_rows.append(b_step)
-            C_rows.append(jac_x)
-            d_rows.append(d_step)
-
-        A = torch.stack(A_rows)
-        b = torch.stack(b_rows)
-        C = torch.stack(C_rows)
-        d = torch.stack(d_rows)
+        (jacobian_outputs, zero_input_eval) = torch.func.vmap(
+            torch.func.jacrev(_run_bw_from_flat_with_aux, argnums=0, has_aux=True)
+        )(zero_carries, batched_fw_intermediates, rev_grad_y)
+        A, C = jacobian_outputs
+        b, d = zero_input_eval
 
         def _compose(lhs, rhs):
             A_l, b_l = lhs
@@ -1041,16 +1044,16 @@ class ScanAutogradImpl:
             _compose, (A, b), dim=0, combine_mode="generic"
         )
         init_flat = grad_carry[0].reshape(-1)
-        grad_carry_out_rev = (
-            torch.matmul(A_cumulative, init_flat.unsqueeze(-1)).squeeze(-1)
-            + b_cumulative
-        )
+        init_flat_batch = init_flat.view(1, -1, 1).expand(scan_length, -1, -1)
+        grad_carry_out_rev = torch.baddbmm(
+            b_cumulative.unsqueeze(-1), A_cumulative, init_flat_batch
+        ).squeeze(-1)
         grad_carry_in_at_steps_rev = torch.cat(
             [init_flat.unsqueeze(0), grad_carry_out_rev[:-1]]
         )
-        grad_x_rev = (
-            torch.matmul(C, grad_carry_in_at_steps_rev.unsqueeze(-1)).squeeze(-1) + d
-        )
+        grad_x_rev = torch.baddbmm(
+            d.unsqueeze(-1), C, grad_carry_in_at_steps_rev.unsqueeze(-1)
+        ).squeeze(-1)
 
         grad_init = grad_carry_out_rev[-1].reshape(carry_shape)
         grad_x = torch.flip(grad_x_rev, (0,)).reshape(self.xs[0].shape)
