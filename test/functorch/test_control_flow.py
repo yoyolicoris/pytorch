@@ -2,6 +2,7 @@
 import contextlib
 import functools
 import unittest
+from unittest import mock
 
 import torch
 import torch.utils._pytree as pytree
@@ -2593,6 +2594,63 @@ class <lambda>(torch.nn.Module):
         out = scan(combine_fn, init, xs, dim=dim)
         exp_out = _fake_scan(combine_fn, init, xs, dim=dim)
         self.assertEqual(out, exp_out)
+
+    @requires_cuda
+    def test_scan_associative_backward_fast_path_matches_fallback(self):
+        from torch._higher_order_ops.scan import ScanAutogradImpl
+
+        def combine_fn(carry, x):
+            next_carry = torch.sin(carry) + x
+            return next_carry, next_carry * x
+
+        init = torch.randn(16, device="cuda", requires_grad=True)
+        xs = torch.randn(12, 16, device="cuda", requires_grad=True)
+
+        def run(force_fast_path):
+            init_inp = init.detach().clone().requires_grad_(True)
+            xs_inp = xs.detach().clone().requires_grad_(True)
+            with mock.patch.object(
+                ScanAutogradImpl,
+                "_can_use_associative_bw_fast_path",
+                return_value=force_fast_path,
+            ):
+                final_carry, ys = scan(combine_fn, init_inp, xs_inp, dim=0)
+                loss = final_carry.square().sum() + ys.square().sum()
+                return torch.autograd.grad(loss, (init_inp, xs_inp))
+
+        grad_fast = run(True)
+        grad_fallback = run(False)
+        self.assertEqual(grad_fast, grad_fallback)
+
+    @requires_cuda
+    def test_scan_associative_backward_fast_path_failure_falls_back(self):
+        from torch._higher_order_ops.scan import ScanAutogradImpl
+
+        def combine_fn(carry, x):
+            next_carry = torch.sin(carry) + x
+            return next_carry, next_carry * x
+
+        init = torch.randn(8, device="cuda", requires_grad=True)
+        xs = torch.randn(10, 8, device="cuda", requires_grad=True)
+
+        def compute_grads():
+            init_inp = init.detach().clone().requires_grad_(True)
+            xs_inp = xs.detach().clone().requires_grad_(True)
+            final_carry, ys = scan(combine_fn, init_inp, xs_inp, dim=0)
+            loss = final_carry.square().sum() + ys.square().sum()
+            return torch.autograd.grad(loss, (init_inp, xs_inp))
+
+        with mock.patch.object(
+            ScanAutogradImpl, "_can_use_associative_bw_fast_path", return_value=True
+        ), mock.patch.object(
+            ScanAutogradImpl,
+            "_call_backward_associative_fast_path",
+            side_effect=RuntimeError("forced fast-path failure"),
+        ):
+            grad_fallback_after_failure = compute_grads()
+
+        grad_reference = compute_grads()
+        self.assertEqual(grad_fallback_after_failure, grad_reference)
 
     # TODO: provide an implementation for all compile modes and re-enable all test
     @skipIfTorchDynamo("don't test compile on compile")

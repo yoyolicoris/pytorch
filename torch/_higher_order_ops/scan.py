@@ -47,6 +47,7 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 logger: logging.Logger = logging.getLogger(__name__)
 aten = torch._ops.ops.aten
+_SCAN_ASSOC_BW_MAX_STATE_NUMEL = 128
 
 
 def wrap_combine_fn_flat(
@@ -773,7 +774,7 @@ class ScanAutogradImpl:
         self.saved_intermediates.extend(saved_intermediates)
         return tuple(fw_outs)
 
-    def call_backward(self, *grad_fw_outputs):
+    def _call_backward_reverse_scan(self, *grad_fw_outputs):
         """
         Recall that fw_outputs = (*carry, *ys), bw_gm takes in (*fw_intermediates, *grad_carry, *grad_ys)
         and returns (*grad_init, *grad_xs, *grad_additional_inputs)
@@ -916,6 +917,140 @@ class ScanAutogradImpl:
                 grad_additional_inputs, additional_inputs_tensor_masks
             ),
         )
+
+    def _rebuild_fw_intermediates_for_step(self, step_idx: int) -> list[Any]:
+        fw_intermediates = []
+        xs_it = iter(self.saved_fw_xs)
+        carry_it = iter(self.saved_intermediates)
+        addi_it = iter(self.saved_fw_additional_inputs)
+        for policy in self.forward_intermediates_handling_policies:
+            if policy in (
+                ScanForwardIntermediatesHandlingPolicy.CLONE,
+                ScanForwardIntermediatesHandlingPolicy.KEEP,
+            ):
+                fw_intermediates.append(next(carry_it)[step_idx])
+            elif policy == ScanForwardIntermediatesHandlingPolicy.REMOVE_XS:
+                fw_intermediates.append(next(xs_it)[step_idx])
+            elif policy == ScanForwardIntermediatesHandlingPolicy.REMOVE_ADDITIONAL_INPUTS:
+                fw_intermediates.append(next(addi_it))
+            else:
+                raise RuntimeError(f"Unknown policy: {policy}")
+        return fw_intermediates
+
+    def _can_use_associative_bw_fast_path(self, grad_carry, grad_ys) -> bool:
+        if len(self.init) != 1 or len(self.xs) != 1:
+            return False
+        if len(self.additional_inputs) != 0:
+            return False
+        if len(grad_carry) != 1 or len(grad_ys) != 1:
+            return False
+        g_carry = grad_carry[0]
+        g_y = grad_ys[0]
+        if not isinstance(g_carry, torch.Tensor) or not isinstance(g_y, torch.Tensor):
+            return False
+        if g_carry.is_sparse or g_y.is_sparse:
+            return False
+        if g_carry.device.type != "cuda" or g_y.device.type != "cuda":
+            return False
+        if g_carry.dtype != g_y.dtype:
+            return False
+        if not (g_carry.dtype.is_floating_point or g_carry.dtype.is_complex):
+            return False
+        if g_carry.numel() > _SCAN_ASSOC_BW_MAX_STATE_NUMEL:
+            return False
+        if g_y.shape[0] != self.xs[0].shape[0]:
+            return False
+        return True
+
+    def _call_backward_associative_fast_path(self, *grad_fw_outputs):
+        from torch._higher_order_ops.associative_scan import associative_scan
+
+        n_carry = len(self.init)
+        grad_carry, grad_ys = grad_fw_outputs[:n_carry], grad_fw_outputs[n_carry:]
+        carry_shape = grad_carry[0].shape
+        x_shape = self.xs[0].shape[1:]
+        scan_length = self.xs[0].shape[0]
+        n_state = grad_carry[0].numel()
+        n_x = self.xs[0][0].numel()
+
+        A_rows = []
+        b_rows = []
+        C_rows = []
+        d_rows = []
+        rev_grad_y = torch.flip(grad_ys[0], (0,))
+
+        for rev_idx in range(scan_length):
+            step_idx = scan_length - 1 - rev_idx
+            fw_intermediates = self._rebuild_fw_intermediates_for_step(step_idx)
+            step_grad_y = rev_grad_y[rev_idx]
+
+            def _run_bw_from_flat(flat_grad_carry: torch.Tensor):
+                in_grad_carry = flat_grad_carry.reshape(carry_shape)
+                flat_out = self.hop_partitioned_graph.bw_gm(
+                    *fw_intermediates,
+                    in_grad_carry,
+                    step_grad_y,
+                )
+                next_grad_carry, grad_xs, _ = split_into_chunks(
+                    flat_out,
+                    [len(self.init), len(self.xs), len(self.additional_inputs)],
+                )
+                return (
+                    next_grad_carry[0].reshape(-1),
+                    grad_xs[0].reshape(-1),
+                )
+
+            zero_carry = torch.zeros_like(grad_carry[0]).reshape(-1)
+            b_step, d_step = _run_bw_from_flat(zero_carry)
+            jac_next, jac_x = torch.autograd.functional.jacobian(
+                _run_bw_from_flat,
+                zero_carry,
+            )
+            A_rows.append(jac_next)
+            b_rows.append(b_step)
+            C_rows.append(jac_x)
+            d_rows.append(d_step)
+
+        A = torch.stack(A_rows)
+        b = torch.stack(b_rows)
+        C = torch.stack(C_rows)
+        d = torch.stack(d_rows)
+
+        def _compose(lhs, rhs):
+            A_l, b_l = lhs
+            A_r, b_r = rhs
+            A_new = torch.matmul(A_r, A_l)
+            b_new = torch.matmul(A_r, b_l.unsqueeze(-1)).squeeze(-1) + b_r
+            return A_new, b_new
+
+        A_prefix, b_prefix = associative_scan(
+            _compose, (A, b), dim=0, combine_mode="generic"
+        )
+        init_flat = grad_carry[0].reshape(-1)
+        grad_carry_out_rev = (
+            torch.matmul(A_prefix, init_flat.unsqueeze(-1)).squeeze(-1) + b_prefix
+        )
+        grad_carry_in_rev = torch.cat([init_flat.unsqueeze(0), grad_carry_out_rev[:-1]])
+        grad_x_rev = (
+            torch.matmul(C, grad_carry_in_rev.unsqueeze(-1)).squeeze(-1) + d
+        )
+
+        grad_init = grad_carry_out_rev[-1].reshape(carry_shape)
+        grad_x = torch.flip(grad_x_rev, (0,)).reshape(self.xs[0].shape)
+        return (grad_init, grad_x)
+
+    def call_backward(self, *grad_fw_outputs):
+        n_carry = len(self.init)
+        grad_carry, grad_ys = grad_fw_outputs[:n_carry], grad_fw_outputs[n_carry:]
+        if self._can_use_associative_bw_fast_path(grad_carry, grad_ys):
+            try:
+                return self._call_backward_associative_fast_path(*grad_fw_outputs)
+            except Exception:
+                logger.debug(
+                    "scan associative backward fast path failed; falling back",
+                    exc_info=True,
+                )
+        return self._call_backward_reverse_scan(*grad_fw_outputs)
 
 
 @scan_op.py_autograd_impl
