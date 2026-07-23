@@ -47,7 +47,7 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 logger: logging.Logger = logging.getLogger(__name__)
 aten = torch._ops.ops.aten
-_SCAN_ASSOC_BW_MAX_STATE_NUMEL = 128
+_SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL = 128
 
 
 def wrap_combine_fn_flat(
@@ -956,7 +956,7 @@ class ScanAutogradImpl:
             return False
         if not (g_carry.dtype.is_floating_point or g_carry.dtype.is_complex):
             return False
-        if g_carry.numel() > _SCAN_ASSOC_BW_MAX_STATE_NUMEL:
+        if g_carry.numel() > _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL:
             return False
         if g_y.shape[0] != self.xs[0].shape[0]:
             return False
@@ -1001,11 +1001,14 @@ class ScanAutogradImpl:
                 )
 
             zero_carry = torch.zeros_like(grad_carry[0]).reshape(-1)
-            b_step, d_step = _run_bw_from_flat(zero_carry)
-            jac_next, jac_x = torch.autograd.functional.jacobian(
-                _run_bw_from_flat,
-                zero_carry,
-            )
+
+            def _run_bw_from_flat_with_aux(flat_grad_carry):
+                out = _run_bw_from_flat(flat_grad_carry)
+                return out, out
+
+            (jac_next, jac_x), (b_step, d_step) = torch.func.jacrev(
+                _run_bw_from_flat_with_aux, has_aux=True
+            )(zero_carry)
             A_rows.append(jac_next)
             b_rows.append(b_step)
             C_rows.append(jac_x)
@@ -1045,7 +1048,7 @@ class ScanAutogradImpl:
         if self._can_use_associative_bw_fast_path(grad_carry, grad_ys):
             try:
                 return self._call_backward_associative_fast_path(*grad_fw_outputs)
-            except Exception:
+            except (RuntimeError, ValueError, AssertionError):
                 logger.debug(
                     "scan associative backward fast path failed; falling back",
                     exc_info=True,
