@@ -2652,6 +2652,49 @@ class <lambda>(torch.nn.Module):
         grad_reference = compute_grads()
         self.assertEqual(grad_fallback_after_failure, grad_reference)
 
+    @requires_cuda
+    def test_scan_associative_backward_fast_path_state_size_threshold(self):
+        from torch._higher_order_ops.scan import ScanAutogradImpl
+
+        def combine_fn(carry, x):
+            next_carry = torch.sin(carry) + x
+            return next_carry, next_carry * x
+
+        def _run_with_state_size(state_size):
+            init = torch.randn(state_size, device="cuda", requires_grad=True)
+            xs = torch.randn(6, state_size, device="cuda", requires_grad=True)
+            with mock.patch.object(
+                ScanAutogradImpl,
+                "_call_backward_associative_fast_path",
+                side_effect=RuntimeError("forced fast-path failure"),
+            ) as fast_path_mock:
+                final_carry, ys = scan(combine_fn, init, xs, dim=0)
+                loss = final_carry.square().sum() + ys.square().sum()
+                torch.autograd.grad(loss, (init, xs))
+            return fast_path_mock.called
+
+        self.assertTrue(_run_with_state_size(128))
+        self.assertFalse(_run_with_state_size(129))
+
+    def test_scan_associative_backward_fast_path_ineligible_on_cpu(self):
+        from torch._higher_order_ops.scan import ScanAutogradImpl
+
+        def combine_fn(carry, x):
+            next_carry = torch.sin(carry) + x
+            return next_carry, next_carry * x
+
+        init = torch.randn(16, requires_grad=True)
+        xs = torch.randn(5, 16, requires_grad=True)
+        with mock.patch.object(
+            ScanAutogradImpl,
+            "_call_backward_associative_fast_path",
+            side_effect=RuntimeError("forced fast-path failure"),
+        ) as fast_path_mock:
+            final_carry, ys = scan(combine_fn, init, xs, dim=0)
+            loss = final_carry.square().sum() + ys.square().sum()
+            torch.autograd.grad(loss, (init, xs))
+        self.assertFalse(fast_path_mock.called)
+
     # TODO: provide an implementation for all compile modes and re-enable all test
     @skipIfTorchDynamo("don't test compile on compile")
     @requires_cuda

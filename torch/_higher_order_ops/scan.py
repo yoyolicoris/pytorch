@@ -47,7 +47,11 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 logger: logging.Logger = logging.getLogger(__name__)
 aten = torch._ops.ops.aten
+# Jacobian materialization in the associative backward path is O(T * N^2).
+# Keep this path for modest carry states where transform composition can
+# still amortize the backward recurrence on supported accelerators.
 _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL = 128
+_SCAN_ASSOCIATIVE_BACKWARD_MAX_SCAN_LENGTH = 256
 
 
 def wrap_combine_fn_flat(
@@ -960,6 +964,8 @@ class ScanAutogradImpl:
             return False
         if g_y.shape[0] != self.xs[0].shape[0]:
             return False
+        if g_y.shape[0] > _SCAN_ASSOCIATIVE_BACKWARD_MAX_SCAN_LENGTH:
+            return False
         return True
 
     def _call_backward_associative_fast_path(self, *grad_fw_outputs):
@@ -1048,9 +1054,10 @@ class ScanAutogradImpl:
         if self._can_use_associative_bw_fast_path(grad_carry, grad_ys):
             try:
                 return self._call_backward_associative_fast_path(*grad_fw_outputs)
-            except (RuntimeError, ValueError, AssertionError):
+            except (RuntimeError, ValueError) as e:
                 logger.debug(
-                    "scan associative backward fast path failed; falling back",
+                    "scan associative backward fast path failed with %s; falling back",
+                    type(e).__name__,
                     exc_info=True,
                 )
         return self._call_backward_reverse_scan(*grad_fw_outputs)
