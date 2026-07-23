@@ -47,12 +47,8 @@ from torch.utils._python_dispatch import _get_current_dispatch_mode
 
 logger: logging.Logger = logging.getLogger(__name__)
 aten = torch._ops.ops.aten
-# Jacobian materialization in the associative backward path is O(T * N^2).
-# Keep this path for modest carry states where transform composition can
-# still amortize the backward recurrence on supported accelerators.
-# _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL bounds N (carry-state flattened
-# element count) and _SCAN_ASSOCIATIVE_BACKWARD_MAX_SCAN_LENGTH bounds T
-# (number of scan steps).
+# Fast path O(T * N^2) Jacobian materialization is bounded by thresholds:
+# N (state numel) and T (scan length).
 _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL = 128
 _SCAN_ASSOCIATIVE_BACKWARD_MAX_SCAN_LENGTH = 256
 
@@ -925,7 +921,7 @@ class ScanAutogradImpl:
             ),
         )
 
-    def _rebuild_fw_intermediates_for_step(self, step_idx: int) -> list[Any]:
+    def _rebuild_forward_intermediates_for_step(self, step_idx: int) -> list[Any]:
         fw_intermediates = []
         xs_it = iter(self.saved_fw_xs)
         carry_it = iter(self.saved_intermediates)
@@ -990,10 +986,10 @@ class ScanAutogradImpl:
 
         for backward_step_idx in range(scan_length):
             step_idx = scan_length - 1 - backward_step_idx
-            fw_intermediates = self._rebuild_fw_intermediates_for_step(step_idx)
+            fw_intermediates = self._rebuild_forward_intermediates_for_step(step_idx)
             step_grad_y = rev_grad_y[backward_step_idx]
 
-            def _run_bw_from_flat(flat_grad_carry: torch.Tensor):
+            def _run_backward_from_flat(flat_grad_carry: torch.Tensor):
                 in_grad_carry = flat_grad_carry.reshape(carry_shape)
                 flat_out = self.hop_partitioned_graph.bw_gm(
                     *fw_intermediates,
@@ -1014,11 +1010,9 @@ class ScanAutogradImpl:
             zero_carry = torch.zeros_like(grad_carry[0]).reshape(-1)
 
             def _run_bw_from_flat_with_aux(flat_grad_carry):
-                # jacrev(has_aux=True) computes jacobians for both tensors in
-                # the primary tuple and returns the auxiliary tuple
-                # un-differentiated. Duplicating outputs lets us get jacobians
-                # and zero-input evaluations in one call.
-                out = _run_bw_from_flat(flat_grad_carry)
+                # Duplicate outputs to get Jacobians and zero-input eval in one
+                # jacrev call.
+                out = _run_backward_from_flat(flat_grad_carry)
                 return out, out
 
             (jacobian_outputs, zero_input_eval) = torch.func.jacrev(
@@ -1070,7 +1064,7 @@ class ScanAutogradImpl:
                 return self._call_backward_associative_fast_path(*grad_fw_outputs)
             except (RuntimeError, ValueError) as e:
                 logger.debug(
-                    "scan associative backward fast path failed with %s; falling back",
+                    "scan associative backward fast path failed (%s), falling back to reverse scan",
                     type(e).__name__,
                     exc_info=True,
                 )
