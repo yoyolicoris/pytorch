@@ -2654,7 +2654,10 @@ class <lambda>(torch.nn.Module):
 
     @requires_cuda
     def test_scan_associative_backward_fast_path_state_size_threshold(self):
-        from torch._higher_order_ops.scan import ScanAutogradImpl
+        from torch._higher_order_ops.scan import (
+            _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL,
+            ScanAutogradImpl,
+        )
 
         def combine_fn(carry, x):
             next_carry = torch.sin(carry) + x
@@ -2673,8 +2676,12 @@ class <lambda>(torch.nn.Module):
                 torch.autograd.grad(loss, (init, xs))
             return fast_path_mock.called
 
-        self.assertTrue(_run_with_state_size(128))
-        self.assertFalse(_run_with_state_size(129))
+        self.assertTrue(
+            _run_with_state_size(_SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL)
+        )
+        self.assertFalse(
+            _run_with_state_size(_SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL + 1)
+        )
 
     def test_scan_associative_backward_fast_path_ineligible_on_cpu(self):
         from torch._higher_order_ops.scan import ScanAutogradImpl

@@ -50,6 +50,8 @@ aten = torch._ops.ops.aten
 # Jacobian materialization in the associative backward path is O(T * N^2).
 # Keep this path for modest carry states where transform composition can
 # still amortize the backward recurrence on supported accelerators.
+# MAX_STATE_NUMEL bounds N (carry-state flattened element count) and
+# MAX_SCAN_LENGTH bounds T (number of scan steps).
 _SCAN_ASSOCIATIVE_BACKWARD_MAX_STATE_NUMEL = 128
 _SCAN_ASSOCIATIVE_BACKWARD_MAX_SCAN_LENGTH = 256
 
@@ -1001,7 +1003,8 @@ class ScanAutogradImpl:
                     flat_out,
                     [len(self.init), len(self.xs), len(self.additional_inputs)],
                 )
-                # Fast-path eligibility requires no lifted additional_inputs.
+                # Fast-path eligibility enforces empty additional_inputs, so
+                # this third chunk is always empty here.
                 return (
                     next_grad_carry[0].reshape(-1),
                     grad_xs[0].reshape(-1),
@@ -1017,9 +1020,11 @@ class ScanAutogradImpl:
                 out = _run_bw_from_flat(flat_grad_carry)
                 return out, out
 
-            (jac_next, jac_x), (b_step, d_step) = torch.func.jacrev(
+            (jacobian_outputs, zero_input_eval) = torch.func.jacrev(
                 _run_bw_from_flat_with_aux, has_aux=True
             )(zero_carry)
+            jac_next, jac_x = jacobian_outputs
+            b_step, d_step = zero_input_eval
             A_rows.append(jac_next)
             b_rows.append(b_step)
             C_rows.append(jac_x)
