@@ -985,10 +985,10 @@ class ScanAutogradImpl:
         d_rows = []
         rev_grad_y = torch.flip(grad_ys[0], (0,))
 
-        for rev_idx in range(scan_length):
-            step_idx = scan_length - 1 - rev_idx
+        for backward_step_idx in range(scan_length):
+            step_idx = scan_length - 1 - backward_step_idx
             fw_intermediates = self._rebuild_fw_intermediates_for_step(step_idx)
-            step_grad_y = rev_grad_y[rev_idx]
+            step_grad_y = rev_grad_y[backward_step_idx]
 
             def _run_bw_from_flat(flat_grad_carry: torch.Tensor):
                 in_grad_carry = flat_grad_carry.reshape(carry_shape)
@@ -1001,6 +1001,7 @@ class ScanAutogradImpl:
                     flat_out,
                     [len(self.init), len(self.xs), len(self.additional_inputs)],
                 )
+                # Fast-path eligibility requires no lifted additional_inputs.
                 return (
                     next_grad_carry[0].reshape(-1),
                     grad_xs[0].reshape(-1),
@@ -1009,6 +1010,10 @@ class ScanAutogradImpl:
             zero_carry = torch.zeros_like(grad_carry[0]).reshape(-1)
 
             def _run_bw_from_flat_with_aux(flat_grad_carry):
+                # jacrev(has_aux=True) computes jacobians of the first output and
+                # returns the second output un-differentiated, so we duplicate the
+                # step outputs to get both derivatives and zero-input evaluations
+                # in one call.
                 out = _run_bw_from_flat(flat_grad_carry)
                 return out, out
 
@@ -1032,12 +1037,13 @@ class ScanAutogradImpl:
             b_new = torch.matmul(A_r, b_l.unsqueeze(-1)).squeeze(-1) + b_r
             return A_new, b_new
 
-        A_prefix, b_prefix = associative_scan(
+        A_cumulative, b_cumulative = associative_scan(
             _compose, (A, b), dim=0, combine_mode="generic"
         )
         init_flat = grad_carry[0].reshape(-1)
         grad_carry_out_rev = (
-            torch.matmul(A_prefix, init_flat.unsqueeze(-1)).squeeze(-1) + b_prefix
+            torch.matmul(A_cumulative, init_flat.unsqueeze(-1)).squeeze(-1)
+            + b_cumulative
         )
         grad_carry_in_rev = torch.cat([init_flat.unsqueeze(0), grad_carry_out_rev[:-1]])
         grad_x_rev = (
