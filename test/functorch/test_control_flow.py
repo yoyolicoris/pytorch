@@ -3995,32 +3995,6 @@ class GraphModule(torch.nn.Module):
                     params,
                 )
 
-    def test_scan_higher_order_gradients(self):
-        def f(init, xs):
-            def combine(carry, x):
-                y = torch.tanh(carry + x)
-                return y, y.clone()
-
-            return scan(combine, init, xs)
-
-        init = torch.randn(1, 2, dtype=torch.double, requires_grad=True)
-        xs = torch.randn(3, 1, 2, dtype=torch.double, requires_grad=True)
-
-        self.assertTrue(
-            torch.autograd.gradcheck(f, (init, xs), raise_exception=False),
-        )
-        self.assertTrue(
-            torch.autograd.gradgradcheck(f, (init, xs), raise_exception=False),
-        )
-
-        carry, ys = f(init, xs)
-        grad_init, grad_xs = torch.autograd.grad(
-            carry.sum() + ys.sum(), (init, xs), create_graph=True
-        )
-        for grad in (grad_init, grad_xs):
-            self.assertTrue(grad.requires_grad)
-            self.assertIsNotNone(grad.grad_fn)
-
     def test_scan_break_bw_input_output_aliasing(self):
         # Focused test for ScanAutogradImpl._break_bw_input_output_aliasing.
         # The partitioner naturally produces direct placeholder outputs (covered

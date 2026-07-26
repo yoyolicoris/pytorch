@@ -529,10 +529,6 @@ class ScanAutogradOp(torch.autograd.Function):
         ctx._scan_impl = ScanAutogradImpl(
             hop_partitioned_graph, init, xs, additional_inputs
         )
-        # Snapshot dispatch key state from forward so backward graph materialization
-        # can recreate grad-tracked graphs for higher-order AD.
-        ctx._scan_impl._fw_include_key_set = torch._C._dispatch_tls_local_include_set()
-        ctx._scan_impl._fw_exclude_key_set = torch._C._dispatch_tls_local_exclude_set()
         with torch._C._AutoDispatchBelowAutograd():
             return ctx._scan_impl.call_forward()
 
@@ -594,8 +590,6 @@ class ScanAutogradImpl:
         self.saved_fw_xs: list[Any] = []
         self.saved_fw_additional_inputs: list[Any] = []
         self.saved_intermediates: list[Any] = []
-        self._fw_include_key_set: torch._C.DispatchKeySet | None = None
-        self._fw_exclude_key_set: torch._C.DispatchKeySet | None = None
         self.fw_spec = pytree.tree_flatten((init, xs, additional_inputs))[1]
         self._optimize_forward_intermediates()
         self._break_bw_input_output_aliasing()
@@ -810,20 +804,6 @@ class ScanAutogradImpl:
         saved_fw_xs = self.saved_fw_xs
         saved_fw_additional_inputs = self.saved_fw_additional_inputs
 
-        # Forward runs under AutoDispatchBelowAutograd, so saved_intermediates are
-        # detached from autograd history. For higher-order gradients, replay the
-        # forward scan under grad mode to recover graph-connected intermediates.
-        if torch.is_grad_enabled():
-            fw_outputs_and_intermediates: tuple[Any] = scan_op(
-                self.hop_partitioned_graph.fw_gm,
-                self.init,
-                self.xs,
-                self.additional_inputs,
-            )  # type: ignore[return-type]
-            saved_intermediates = fw_outputs_and_intermediates[
-                self.hop_partitioned_graph.n_fw_outputs :
-            ]
-
         n_carry = len(self.init)
 
         grad_carry, grad_ys = grad_fw_outputs[:n_carry], grad_fw_outputs[n_carry:]
@@ -915,9 +895,6 @@ class ScanAutogradImpl:
                     0
                 ]
             ),
-            self._fw_include_key_set,
-            self._fw_exclude_key_set,
-            force_enable_grad=True,
         )
 
         flat_grads = scan_op(
