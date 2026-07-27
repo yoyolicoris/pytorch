@@ -3995,6 +3995,36 @@ class GraphModule(torch.nn.Module):
                     params,
                 )
 
+    def test_scan_higher_order_gradients(self):
+        # torch.scan should support higher-order gradients (gradgradcheck):
+        # first-order grads from autograd.grad(..., create_graph=True) must stay
+        # connected to the autograd graph so second-order differentiation works.
+        # The autograd path exposes the per-step carries as connected outputs and
+        # recomputes intermediates from them in backward (no forward replay).
+        def f(h0, xs, w):
+            def combine(h, x):
+                y = torch.tanh(h @ w + x)
+                return y, y.clone()
+
+            return scan(combine, h0, xs)
+
+        T, B, D = 4, 2, 3
+        torch.manual_seed(0)
+        w = torch.randn(D, D, dtype=torch.double, requires_grad=True)
+        h0 = torch.randn(B, D, dtype=torch.double, requires_grad=True)
+        xs = torch.randn(T, B, D, dtype=torch.double, requires_grad=True)
+
+        self.assertTrue(torch.autograd.gradcheck(f, (h0, xs, w)))
+        self.assertTrue(torch.autograd.gradgradcheck(f, (h0, xs, w)))
+
+        # First-order grads under create_graph must be graph-connected.
+        carry, ys = f(h0, xs, w)
+        loss = (carry**2).sum() + (ys**2).sum()
+        grads = torch.autograd.grad(loss, (h0, xs, w), create_graph=True)
+        for g in grads:
+            self.assertTrue(g.requires_grad)
+            self.assertIsNotNone(g.grad_fn)
+
     def test_scan_break_bw_input_output_aliasing(self):
         # Focused test for ScanAutogradImpl._break_bw_input_output_aliasing.
         # The partitioner naturally produces direct placeholder outputs (covered

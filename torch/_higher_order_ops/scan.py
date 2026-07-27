@@ -1,4 +1,5 @@
 # mypy: allow-untyped-defs
+import copy
 import enum
 import functools
 import itertools
@@ -529,6 +530,10 @@ class ScanAutogradOp(torch.autograd.Function):
         ctx._scan_impl = ScanAutogradImpl(
             hop_partitioned_graph, init, xs, additional_inputs
         )
+        # Snapshot the forward dispatch key state so backward graph
+        # materialization can recreate grad-tracked graphs for higher-order AD.
+        ctx._scan_impl._fw_include_key_set = torch._C._dispatch_tls_local_include_set()
+        ctx._scan_impl._fw_exclude_key_set = torch._C._dispatch_tls_local_exclude_set()
         with torch._C._AutoDispatchBelowAutograd():
             return ctx._scan_impl.call_forward()
 
@@ -589,8 +594,14 @@ class ScanAutogradImpl:
         ] = []
         self.saved_fw_xs: list[Any] = []
         self.saved_fw_additional_inputs: list[Any] = []
-        self.saved_intermediates: list[Any] = []
+        self.saved_carries: list[Any] = []
+        # Lean forward graph (only the fw_outputs, no saved intermediates) run by
+        # call_forward; intermediates are recomputed from the carries in backward.
+        self.fw_gm_forward: torch.fx.GraphModule | None = None
+        self._fw_include_key_set: torch._C.DispatchKeySet | None = None
+        self._fw_exclude_key_set: torch._C.DispatchKeySet | None = None
         self.fw_spec = pytree.tree_flatten((init, xs, additional_inputs))[1]
+        self.n_original_fw_outputs = hop_partitioned_graph.n_fw_outputs - len(init)
         self._optimize_forward_intermediates()
         self._break_bw_input_output_aliasing()
 
@@ -751,26 +762,34 @@ class ScanAutogradImpl:
         fw_gm.graph.lint()
         fw_gm.recompile()
 
+        # Build the lean forward graph used by call_forward: it returns only the
+        # fw_outputs (carries, ys and the appended carry copies) and drops every
+        # saved intermediate, so the forward scan never stacks them. Backward
+        # recomputes those intermediates per step from the connected carries using
+        # the full fw_gm above. Dead-code elimination removes any computation that
+        # only fed the dropped intermediates.
+        n_fw_outputs = self.hop_partitioned_graph.n_fw_outputs
+        fw_gm_forward = copy.deepcopy(fw_gm)
+        lean_output_node = next(iter(fw_gm_forward.graph.find_nodes(op="output")))
+        lean_output_node.args = (tuple(lean_output_node.args[0][:n_fw_outputs]),)
+        fw_gm_forward.graph.eliminate_dead_code()
+        fw_gm_forward.graph.lint()
+        fw_gm_forward.recompile()
+        self.fw_gm_forward = fw_gm_forward
+
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 "after removing aliasing:\n%s", fw_gm.print_readable(print_output=False)
             )
 
     def call_forward(self):
-        fw_outputs_and_intermediates: tuple[Any] = scan_op(
-            self.hop_partitioned_graph.fw_gm, self.init, self.xs, self.additional_inputs
+        fw_outs: tuple[Any] = scan_op(
+            self.fw_gm_forward, self.init, self.xs, self.additional_inputs
         )  # type: ignore[return-type]
-        fw_outs = fw_outputs_and_intermediates[
-            : self.hop_partitioned_graph.n_fw_outputs
-        ]
-        saved_intermediates = fw_outputs_and_intermediates[
-            self.hop_partitioned_graph.n_fw_outputs :
-        ]
-        if len(self.saved_intermediates) != 0:
-            raise AssertionError(
-                "saved_intermediates should be empty before call_forward"
-            )
-        self.saved_intermediates.extend(saved_intermediates)
+        saved_carries = fw_outs[self.n_original_fw_outputs :]
+        if len(self.saved_carries) != 0:
+            raise AssertionError("saved_carries should be empty before call_forward")
+        self.saved_carries.extend(saved_carries)
         return tuple(fw_outs)
 
     def call_backward(self, *grad_fw_outputs):
@@ -800,13 +819,27 @@ class ScanAutogradImpl:
           grad_x is the ys output, which will be stacked together after the loop and will have the same shape as xs.
         """
         fw_policy = self.forward_intermediates_handling_policies
-        saved_intermediates = self.saved_intermediates
         saved_fw_xs = self.saved_fw_xs
         saved_fw_additional_inputs = self.saved_fw_additional_inputs
 
-        n_carry = len(self.init)
+        # Intermediates are always recomputed per step from the (connected) carries
+        # inside the backward scan, so the forward never stores them. higher_order
+        # only controls whether that recompute is grad-tracked (for double backward).
+        higher_order = torch.is_grad_enabled()
 
-        grad_carry, grad_ys = grad_fw_outputs[:n_carry], grad_fw_outputs[n_carry:]
+        n_carry = len(self.init)
+        n_original_fw_outputs = self.n_original_fw_outputs
+
+        grad_original_fw_outputs = grad_fw_outputs[:n_original_fw_outputs]
+        grad_carries = grad_fw_outputs[n_original_fw_outputs:]
+        grad_carries = tuple(
+            torch.zeros_like(carry) if grad_carry is None else grad_carry
+            for grad_carry, carry in zip(grad_carries, self.saved_carries)
+        )
+        grad_carry, grad_ys = (
+            grad_original_fw_outputs[:n_carry],
+            grad_original_fw_outputs[n_carry:],
+        )
         additional_inputs_tensor_masks = [
             bool(isinstance(t, torch.Tensor)) for t in self.additional_inputs
         ]
@@ -817,13 +850,22 @@ class ScanAutogradImpl:
             )
         ]
 
+        # The per-step input carries [h_0, ..., h_{T-1}] are the linearization points
+        # the backward re-runs fw_gm from: h_0 is the connected init input and
+        # h_1..h_{T-1} are the connected carry outputs saved in forward.
+        stacked_input_carries = [
+            torch.cat([init.unsqueeze(0), carry[:-1]])
+            for init, carry in zip(self.init, self.saved_carries)
+        ]
         bw_init = [grad_carry, grad_additional_inputs]
         bw_xs = [
             grad_ys,
+            grad_carries,
             saved_fw_xs,
-            saved_intermediates,
+            stacked_input_carries,
+            self.xs,
         ]
-        bw_additional_inputs = saved_fw_additional_inputs
+        bw_additional_inputs = [saved_fw_additional_inputs, self.additional_inputs]
 
         _, flat_spec = pytree.tree_flatten((bw_init, bw_xs, bw_additional_inputs))
 
@@ -834,8 +876,20 @@ class ScanAutogradImpl:
                 args, flat_spec
             )
             grad_carry, grad_additional_inputs = bw_init
-            grad_y, saved_fw_xs, saved_intermediates = bw_xs
-            saved_fw_additional_inputs = bw_additional_inputs
+            (
+                grad_y,
+                grad_carry_output,
+                saved_fw_xs,
+                fw_input_carry,
+                fw_xs,
+            ) = bw_xs
+            saved_fw_additional_inputs, fw_additional_inputs = bw_additional_inputs
+            fw_outputs_and_intermediates = self.hop_partitioned_graph.fw_gm(
+                *fw_input_carry, *fw_xs, *fw_additional_inputs
+            )
+            saved_intermediates = fw_outputs_and_intermediates[
+                self.hop_partitioned_graph.n_fw_outputs :
+            ]
 
             fw_intermediates = []
             xs_it = iter(saved_fw_xs)
@@ -857,7 +911,14 @@ class ScanAutogradImpl:
                 else:
                     raise RuntimeError(f"Unknown policy: {policy}")
 
-            grad_fw_outputs = (*grad_carry, *grad_y)
+            folded_grad_carry = [
+                prev + cur for prev, cur in zip(grad_carry, grad_carry_output)
+            ]
+            grad_fw_outputs = (
+                *folded_grad_carry,
+                *grad_y,
+                *(torch.zeros_like(cur) for cur in grad_carry_output),
+            )
 
             flat_out = self.hop_partitioned_graph.bw_gm(
                 *fw_intermediates,
@@ -895,6 +956,9 @@ class ScanAutogradImpl:
                     0
                 ]
             ),
+            self._fw_include_key_set,
+            self._fw_exclude_key_set,
+            force_enable_grad=higher_order,
         )
 
         flat_grads = scan_op(
@@ -921,6 +985,12 @@ class ScanAutogradImpl:
 @scan_op.py_autograd_impl
 def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices=""):
     with disable_proxy_modes_tracing():
+
+        def combine_fn_with_carries(*args):
+            flat_out = pytree.tree_leaves(combine_fn(*args))
+            carries = flat_out[: len(init)]
+            return (*flat_out, *(carry.clone() for carry in carries))
+
         # If init was passed in with requires_grad=False, AOT joint creation drops it from
         # grad_primals and zero-fills, severing the carry chain and silently
         # zeroing gradients that should reach closed-over additional_inputs from
@@ -937,7 +1007,7 @@ def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices="
                 t.requires_grad_(True)
             hop_partitioned_graph: HopPartitionedGraph = (
                 HopGraphMinCutPartitioner.create_partitioned_graph(
-                    combine_fn,
+                    combine_fn_with_carries,
                     (*init, *[x[0] for x in xs], *additional_inputs),
                     always_recompute_complex_exprs=True,
                 )
@@ -946,6 +1016,7 @@ def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices="
             for t in flipped:
                 t.requires_grad_(False)
 
+    n_original_fw_outputs = hop_partitioned_graph.n_fw_outputs - len(init)
     return ScanAutogradOp.apply(
         hop_partitioned_graph,
         len(init),
@@ -954,7 +1025,7 @@ def scan_autograd(combine_fn, init, xs, additional_inputs, mutated_arg_indices="
         *init,
         *xs,
         *additional_inputs,
-    )
+    )[:n_original_fw_outputs]
 
 
 @scan_op.py_impl(ProxyTorchDispatchMode)
