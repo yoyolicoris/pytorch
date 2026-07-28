@@ -45,7 +45,6 @@ from torch.fx.experimental.proxy_tensor import (
 )
 from torch.utils._python_dispatch import _get_current_dispatch_mode
 
-
 logger: logging.Logger = logging.getLogger(__name__)
 aten = torch._ops.ops.aten
 
@@ -841,7 +840,7 @@ class ScanAutogradImpl:
             grad_original_fw_outputs[n_carry:],
         )
         additional_inputs_tensor_masks = [
-            bool(isinstance(t, torch.Tensor)) for t in self.additional_inputs
+            isinstance(t, torch.Tensor) for t in self.additional_inputs
         ]
         grad_additional_inputs = [
             torch.zeros_like(t)
@@ -1156,9 +1155,9 @@ def scan_batch_rule(
             # this is to avoid it interfering with scan's batching
             outputs = tuple(
                 pytree.tree_map(
-                    lambda out, out_bdim: out.movedim(out_bdim, -1)
-                    if out_bdim is not None
-                    else out,
+                    lambda out, out_bdim: (
+                        out.movedim(out_bdim, -1) if out_bdim is not None else out
+                    ),
                     outputs,
                     per_slice_out_dims,
                 )
